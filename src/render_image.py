@@ -1,19 +1,25 @@
-"""为朋友圈生成配图。
-
-每条朋友圈通过即梦 t2i 生成一张视觉化插图(不是文字卡)。
-prompt 由 generate.py 中 Claude 输出的 image_prompt 字段提供。
-"""
+"""为朋友圈生成配图,即梦 t2i (火山引擎)。"""
+import base64
+import json
+import os
 import sys
+import time
 from pathlib import Path
 
-# 复用 zsxq-publisher 的 t2i 包装
-sys.path.insert(0, str(Path.home() / "zsxq-publisher"))
-from gen_image import t2i  # noqa: E402
+import requests
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+from volcengine.visual.VisualService import VisualService
 
 OUT_DIR = Path(__file__).parent.parent / "images"
 OUT_DIR.mkdir(exist_ok=True)
 
-# 三种风格的 visual style suffix (附加到 prompt 末尾,统一品牌感)
+VOLC_AK = os.getenv("VOLC_AK")
+VOLC_SK = os.getenv("VOLC_SK")
+
+# 三种风格
 STYLE_SUFFIX = {
     "cognitive": (
         "极简插画风格,深色背景(墨蓝/深紫/暗红),高对比度,有思考感和锋利感,"
@@ -30,19 +36,65 @@ STYLE_SUFFIX = {
 }
 
 
+def _t2i(prompt: str, out_path: Path, req_key: str = "jimeng_t2i_v40",
+         width: int = 1024, height: int = 1024, max_wait: int = 120) -> Path:
+    if not (VOLC_AK and VOLC_SK):
+        raise RuntimeError("缺少 VOLC_AK / VOLC_SK 环境变量")
+    svc = VisualService()
+    svc.set_ak(VOLC_AK); svc.set_sk(VOLC_SK)
+    form = {"req_key": req_key, "prompt": prompt,
+            "width": width, "height": height, "return_url": True}
+    submit = None
+    for attempt in range(12):
+        try:
+            submit = svc.cv_sync2async_submit_task(form)
+            if isinstance(submit, dict) and submit.get("code") == 10000:
+                break
+            if isinstance(submit, dict) and ("50430" in str(submit) or "Concurrent" in str(submit)):
+                time.sleep(5 + attempt * 3); continue
+            raise RuntimeError(f"提交失败: {submit}")
+        except Exception as e:
+            if "50430" in str(e) or "Concurrent" in str(e):
+                print(f"  并发限制,{5 + attempt * 3}s 后重试 ({attempt+1}/12)", flush=True)
+                time.sleep(5 + attempt * 3); continue
+            raise
+    else:
+        raise RuntimeError("12 次提交均触发并发限制")
+
+    task_id = submit["data"]["task_id"]
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        time.sleep(3)
+        r = svc.cv_sync2async_get_result({
+            "req_key": req_key, "task_id": task_id,
+            "req_json": json.dumps({"return_url": True}),
+        })
+        st = (r.get("data") or {}).get("status")
+        if st in ("done", "success"):
+            data = r["data"]
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            if data.get("binary_data_base64"):
+                out_path.write_bytes(base64.b64decode(data["binary_data_base64"][0]))
+            elif data.get("image_urls"):
+                out_path.write_bytes(requests.get(data["image_urls"][0], timeout=60).content)
+            else:
+                raise RuntimeError(f"返回结构异常: {data}")
+            return out_path
+        if "fail" in str(st).lower() or st == "not_found":
+            raise RuntimeError(f"任务失败: {r}")
+    raise RuntimeError("超时")
+
+
 def render(type_: str, image_prompt: str, out_path: Path = None) -> Path:
-    """type_ ∈ {cognitive, case, persona}, image_prompt 是 Claude 给的视觉描述。"""
     style = STYLE_SUFFIX.get(type_, STYLE_SUFFIX["cognitive"])
     full_prompt = f"{image_prompt}。{style}"
     seed_part = abs(hash(image_prompt)) & 0xFFFFFF
     out = out_path or OUT_DIR / f"{type_}_{seed_part:06x}.png"
     print(f"[render] {type_} prompt: {full_prompt[:100]}...")
-    t2i(full_prompt, str(out), req_key="jimeng_t2i_v40", width=1024, height=1024)
-    return out
+    return _t2i(full_prompt, out, req_key="jimeng_t2i_v40", width=1024, height=1024)
 
 
 if __name__ == "__main__":
     type_ = sys.argv[1] if len(sys.argv) > 1 else "cognitive"
     prompt = sys.argv[2] if len(sys.argv) > 2 else "一个龙虾对着电脑思考的卡通形象"
-    out = render(type_, prompt)
-    print(f"✓ {out}")
+    print(f"✓ {render(type_, prompt)}")
