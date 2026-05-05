@@ -2,16 +2,38 @@
 
 数据源:
 1. 云端 douyin-to-wechat 的 queue.json (今日生成的公众号草稿)
-2. 本地 zsxq-publisher 的 posts/ (今日发的星球文)
-3. industry-knowledge-base 02-结构化总结/ (咨询案例摘要)
+2. 本地 zsxq-publisher 的 posts/ (今日发的星球文,git clone 来的)
+3. industry-knowledge-base 02-结构化总结/ (咨询案例摘要,git clone 来的)
 4. 各 GitHub 项目近 24h commit (今天做了啥)
+
+ZSXQ_REPO_PATH / IKB_REPO_PATH 环境变量指定本地 clone 路径。
+若是 git repo,首次调用会自动 git pull 拉最新。
 """
 import json
+import os
 import subprocess
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent.parent / ".env")
+
 CST = timezone(timedelta(hours=8))
+
+ZSXQ_REPO_PATH = Path(os.getenv("ZSXQ_REPO_PATH", str(Path.home() / "zsxq-publisher")))
+IKB_REPO_PATH = Path(os.getenv("IKB_REPO_PATH", str(Path.home() / "industry-knowledge-base")))
+
+
+def _git_pull_if_repo(repo_path: Path) -> None:
+    """如果是 git 仓库就拉最新。失败静默,不影响主流程。"""
+    if not (repo_path / ".git").exists():
+        return
+    try:
+        subprocess.run(["git", "-C", str(repo_path), "pull", "--ff-only", "--quiet"],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
 
 
 def _today_iso():
@@ -37,7 +59,8 @@ def fetch_today_wechat_drafts() -> list:
 
 def fetch_today_zsxq_posts(limit: int = 5) -> list:
     """读本地 zsxq-publisher posts/ 最近的归档。"""
-    posts_dir = Path.home() / "zsxq-publisher" / "posts"
+    _git_pull_if_repo(ZSXQ_REPO_PATH)
+    posts_dir = ZSXQ_REPO_PATH / "posts"
     if not posts_dir.exists():
         return []
     files = sorted(posts_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
@@ -56,10 +79,10 @@ def fetch_today_zsxq_posts(limit: int = 5) -> list:
 
 def fetch_consulting_summary() -> str:
     """读最新的咨询要点摘要 (industry-knowledge-base/02-结构化总结/)。"""
-    kb = Path.home() / "industry-knowledge-base" / "02-结构化总结"
+    _git_pull_if_repo(IKB_REPO_PATH)
+    kb = IKB_REPO_PATH / "02-结构化总结"
     if not kb.exists():
-        # 兜底:从 /tmp/ikb 读 (之前 clone 过)
-        kb = Path("/tmp/ikb/02-结构化总结")
+        kb = Path("/tmp/ikb/02-结构化总结")  # 兜底
     if not kb.exists():
         return ""
     md_files = sorted(kb.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
